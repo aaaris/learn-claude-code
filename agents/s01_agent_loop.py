@@ -25,16 +25,18 @@ policy, hooks, and lifecycle controls on top.
 """
 
 import os
+from pathlib import Path
 import subprocess
 
 try:
     import readline
+
     # #143 UTF-8 backspace fix for macOS libedit
-    readline.parse_and_bind('set bind-tty-special-chars off')
-    readline.parse_and_bind('set input-meta on')
-    readline.parse_and_bind('set output-meta on')
-    readline.parse_and_bind('set convert-meta off')
-    readline.parse_and_bind('set enable-meta-keybindings on')
+    readline.parse_and_bind("set bind-tty-special-chars off")
+    readline.parse_and_bind("set input-meta on")
+    readline.parse_and_bind("set output-meta on")
+    readline.parse_and_bind("set convert-meta off")
+    readline.parse_and_bind("set enable-meta-keybindings on")
 except ImportError:
     pass
 
