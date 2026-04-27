@@ -26,7 +26,10 @@ policy, hooks, and lifecycle controls on top.
 
 import os
 from pathlib import Path
+import re
 import subprocess
+from pydantic.dataclasses import dataclass
+import yaml
 from typing import Any
 
 try:
@@ -47,16 +50,72 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 
+class SkillLoader:
+    def __init__(self, skills_dir: Path) -> None:
+        self.skills = {}
+        self.skills_dir = skills_dir
+        self._load_all()
+
+    def _load_all(self):
+        if not self.skills_dir.exists():
+            print(f"Error: skills dir is not exists")
+            return
+        for f in sorted(self.skills_dir.rglob("SKILL.md")):
+            try:
+                text = f.read_text()
+                meta, body = self._parse_frontmatter(text)
+                name = meta.get("name", f.parent.name)
+                self.skills[name] = {"meta": meta, "body": body}
+            except Exception as e:
+                print(f"Error: load {f.name} failed.", e)
+
+    def _parse_frontmatter(self, text: str) -> tuple[dict, str]:
+        match = re.search(
+            r"^---\s*\n(.*?)\n---\s*\n(.*)", text, re.DOTALL | re.MULTILINE
+        )
+        if not match:
+            return {}, text
+            # raise ValueError("Not a valid SKILL.md format")
+        frontmatter_str, body = match.group(1), match.group(2)
+        try:
+            meta = yaml.safe_load(frontmatter_str) or {}
+        except yaml.YAMLError:
+            meta = {}
+        return meta, body.strip()
+
+    def get_description(self) -> str:
+        if not self.skills:
+            return "(no skills available)"
+        lines = []
+        for name, skill in self.skills.items():
+            desc = skill["meta"].get("description", "No description")
+            tags = skill["meta"].get("tags", "")
+            line = f" - {name}: {desc} {f'[{tags}]' if tags else ''}"
+            if tags:
+                line += f" [{tags}]"
+            lines.append(line)
+        return "\n".join(lines)
+
+    def get_content(self, name: str) -> str:
+        skill = self.skills.get(name)
+        if not skill:
+            return f"Error: unknown skill '{name}'"
+        return f'<skill name="{name}">\n{skill["body"]}\n</skill>'
+
 class TodoManager:
     def __init__(self):
         self.items = []
 
     def update(self, items: list[dict[str, Any]]) -> str:
+        if not items: 
+            return "Error input schema"
         validated, in_progress_count = [], 0
         for item in items:
             status = item.get("status", "pending")
             if status == "in_progress":
                 in_progress_count += 1
+            if not hasattr(item, "id") or not hasattr(item, "text"):
+                return "Error: item in items do not has correct attr"
             validated.append({"id": item["id"], "text": item["text"], "status": status})
         if in_progress_count > 1:
             raise ValueError("Only one task can be in_progress")
@@ -72,6 +131,8 @@ class TodoManager:
             [f"{marker[item['status']]} {item['text']}" for item in self.items]
         )
 
+if not os.getenv("ANTHROPIC_API_KEY") or not os.getenv("MODEL_ID"):
+    raise ValueError("Plz set ANTHROPIC_AUTH_TOKEN or MODEL_ID first") 
 
 if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
@@ -84,13 +145,27 @@ client = Anthropic(
     },
 )
 MODEL = os.environ["MODEL_ID"]
+WORKDIR = Path.cwd()
+SKILL_LOADER = SkillLoader(WORKDIR / "skills")
 
-SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Make todolist before act, don't explain."
+SYSTEM = f"""You are a coding agent at {os.getcwd()}. Make todolist before act, don't explain.
+Skills available:
+{SKILL_LOADER.get_description()}
+"""
 SUBAGENT_SYSTEM = f"You are a coding subagent created by father agent at {os.getcwd()}. Use bash to solve tasks. Make todolist before act, don't explain. After finished task, output the summy task result."
 
 TODO = TodoManager()
 
 CHILD_TOOLS = [
+    {
+        "name": "load_skill",
+        "description": "load the skill content",
+        "input_schema": {
+            "type": "object",
+            "properties": {"name": {"type": "string"}},
+            "required": ["name"],
+        },
+    },
     {
         "name": "bash",
         "description": "Run a shell command.",
@@ -158,7 +233,8 @@ CHILD_TOOLS = [
     },
 ]
 
-PARENT_TOOLS = CHILD_TOOLS + [{
+PARENT_TOOLS = CHILD_TOOLS + [
+    {
         "name": "task",
         "description": "Spawn a subagent with fresh context.",
         "input_schema": {
@@ -166,7 +242,8 @@ PARENT_TOOLS = CHILD_TOOLS + [{
             "properties": {"prompt": {"type": "string"}},
             "required": ["prompt"],
         },
-    }]
+    }
+]
 
 TOOL_HANDLERS = {
     "bash": lambda **kw: run_bash(kw["command"]),
@@ -175,9 +252,11 @@ TOOL_HANDLERS = {
     "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
     "todo": lambda **kw: TODO.update(kw["items"]),
     "task": lambda **kw: run_subagent(kw["prompt"]),
+    "load_skill": lambda **kw: SKILL_LOADER.get_content(kw["name"]),
 }
 
-def run_subagent(prompt: str)->str:
+
+def run_subagent(prompt: str) -> str:
     messages = [{"role": "user", "content": prompt}]
     rounds_since_todo = 0
 
@@ -202,7 +281,7 @@ def run_subagent(prompt: str)->str:
         # Execute each tool call, collect results
         results = []
         for block in response.content:
-            if block.type == "tool_use": 
+            if block.type == "tool_use":
                 print(f"\033[33msubagent$ {block.name}\033[0m")
                 handler = TOOL_HANDLERS.get(block.name)
                 output = (
@@ -226,8 +305,13 @@ def run_subagent(prompt: str)->str:
                     },
                 )
         rounds_since_todo += 1
-    
-    messages.append({"role": "user", "content": "just summize your current work progress and result and do nothing."})
+
+    messages.append(
+        {
+            "role": "user",
+            "content": "just summize your current work progress and result and do nothing.",
+        }
+    )
     response = client.messages.create(
         model=MODEL,
         system=SUBAGENT_SYSTEM,
@@ -235,11 +319,17 @@ def run_subagent(prompt: str)->str:
         tools=CHILD_TOOLS,
         max_tokens=8000,
     )
-    return "".join([block.text for block in response.content if hasattr(block,"text")]) or "Not finished and no summy"
+    return (
+        "".join([block.text for block in response.content if hasattr(block, "text")])
+        or "Not finished and no summy"
+    )
 
 
 def run_bash(command: str) -> str:
+    if not command:
+        return "Error: unexpected commmand"
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
+    #TODO: add more block
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
     try:
@@ -260,7 +350,10 @@ def run_bash(command: str) -> str:
 
 
 def safe_path(p: str) -> Path:
-    path = (Path.cwd() / p).resolve()
+    try:
+        path = (Path.cwd() / p).resolve(strict=True)
+    except Exception as e:
+        raise e
     if not path.is_relative_to(Path.cwd()):
         raise ValueError(f"Path escapes workspace: {p}")
     return path
@@ -278,6 +371,8 @@ def run_read(path: str, limit: int | None = None) -> str:
 
 
 def run_write(path: str, content: str) -> str:
+    if not content:
+        return f"Error: unexpected content"
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
@@ -349,7 +444,7 @@ if __name__ == "__main__":
     history = []
     while True:
         try:
-            query = input("\033[36magent >> \033[0m")
+            query = input(f"\033[36m{MODEL}>> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
