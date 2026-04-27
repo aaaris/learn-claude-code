@@ -51,8 +51,7 @@ class TodoManager:
     def __init__(self):
         self.items = []
 
-    def update(self, items: list[dict[str,Any]]) -> str:
-        print(items)
+    def update(self, items: list[dict[str, Any]]) -> str:
         validated, in_progress_count = [], 0
         for item in items:
             status = item.get("status", "pending")
@@ -86,7 +85,8 @@ client = Anthropic(
 )
 MODEL = os.environ["MODEL_ID"]
 
-SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Act, don't explain."
+SYSTEM = f"You are a coding agent at {os.getcwd()}. Use bash to solve tasks. Make todolist before act, don't explain."
+SUBAGENT_SYSTEM = f"You are a coding subagent created by father agent at {os.getcwd()}. Use bash to solve tasks. Make todolist before act, don't explain. After finished task, output the summy task result."
 
 TODO = TodoManager()
 
@@ -158,13 +158,84 @@ CHILD_TOOLS = [
     },
 ]
 
+PARENT_TOOLS = CHILD_TOOLS + [{
+        "name": "task",
+        "description": "Spawn a subagent with fresh context.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"prompt": {"type": "string"}},
+            "required": ["prompt"],
+        },
+    }]
+
 TOOL_HANDLERS = {
     "bash": lambda **kw: run_bash(kw["command"]),
     "read_file": lambda **kw: run_read(kw["path"], kw.get("limit")),
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
     "todo": lambda **kw: TODO.update(kw["items"]),
+    "task": lambda **kw: run_subagent(kw["prompt"]),
 }
+
+def run_subagent(prompt: str)->str:
+    messages = [{"role": "user", "content": prompt}]
+    rounds_since_todo = 0
+
+    # safe call
+    for _ in range(30):
+        response = client.messages.create(
+            model=MODEL,
+            system=SUBAGENT_SYSTEM,
+            messages=messages,
+            tools=CHILD_TOOLS,
+            max_tokens=8000,
+        )
+        # Append assistant turn
+        messages.append({"role": "assistant", "content": response.content})
+
+        # If the model didn't call a tool, we're done
+        if response.stop_reason != "tool_use":
+            for block in response.content:
+                if hasattr(block, "text"):
+                    return block.text
+            return "Finish! No summy!"
+        # Execute each tool call, collect results
+        results = []
+        for block in response.content:
+            if block.type == "tool_use": 
+                print(f"\033[33msubagent$ {block.name}\033[0m")
+                handler = TOOL_HANDLERS.get(block.name)
+                output = (
+                    handler(**block.input) if handler else f"unknown tool {block.name}"
+                )
+                if block.name == "todo":
+                    print(output)
+                    rounds_since_todo = 0
+                results.append(
+                    {"type": "tool_result", "tool_use_id": block.id, "content": output}
+                )
+        messages.append({"role": "user", "content": results})
+        if rounds_since_todo >= 3 and messages:
+            last = messages[-1]
+            if last["role"] == "user" and isinstance(last.get("content"), list):
+                last["content"].insert(
+                    0,
+                    {
+                        "type": "text",
+                        "text": "<reminder>Update your todos.</reminder>",
+                    },
+                )
+        rounds_since_todo += 1
+    
+    messages.append({"role": "user", "content": "just summize your current work progress and result and do nothing."})
+    response = client.messages.create(
+        model=MODEL,
+        system=SUBAGENT_SYSTEM,
+        messages=messages,
+        tools=CHILD_TOOLS,
+        max_tokens=8000,
+    )
+    return "".join([block.text for block in response.content if hasattr(block,"text")]) or "Not finished and no summy"
 
 
 def run_bash(command: str) -> str:
@@ -236,7 +307,7 @@ def agent_loop(messages: list):
             model=MODEL,
             system=SYSTEM,
             messages=messages,
-            tools=TOOLS,
+            tools=PARENT_TOOLS,
             max_tokens=8000,
         )
         # Append assistant turn
@@ -254,8 +325,8 @@ def agent_loop(messages: list):
                 output = (
                     handler(**block.input) if handler else f"unknown tool {block.name}"
                 )
-                print(output[:200])
                 if block.name == "todo":
+                    print(output)
                     rounds_since_todo = 0
                 results.append(
                     {"type": "tool_result", "tool_use_id": block.id, "content": output}
