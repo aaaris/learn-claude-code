@@ -24,13 +24,17 @@ until the model decides to stop. Production agents layer
 policy, hooks, and lifecycle controls on top.
 """
 
+import json
+import shlex
+import platform
 import os
 from pathlib import Path
 import re
 import subprocess
-from pydantic.dataclasses import dataclass
+from time import time
 import yaml
 from typing import Any
+
 
 try:
     import readline
@@ -99,22 +103,23 @@ class SkillLoader:
     def get_content(self, name: str) -> str:
         skill = self.skills.get(name)
         if not skill:
-            return f"Error: unknown skill '{name}'"
+            return f"Error: unknown skill '{name}'. Available: {', '.join(self.skills.keys())}"
         return f'<skill name="{name}">\n{skill["body"]}\n</skill>'
+
 
 class TodoManager:
     def __init__(self):
         self.items = []
 
     def update(self, items: list[dict[str, Any]]) -> str:
-        if not items: 
+        if not items:
             return "Error input schema"
         validated, in_progress_count = [], 0
         for item in items:
             status = item.get("status", "pending")
             if status == "in_progress":
                 in_progress_count += 1
-            if not hasattr(item, "id") or not hasattr(item, "text"):
+            if "id" not in item or "text" not in item:
                 return "Error: item in items do not has correct attr"
             validated.append({"id": item["id"], "text": item["text"], "status": status})
         if in_progress_count > 1:
@@ -131,8 +136,9 @@ class TodoManager:
             [f"{marker[item['status']]} {item['text']}" for item in self.items]
         )
 
+
 if not os.getenv("ANTHROPIC_API_KEY") or not os.getenv("MODEL_ID"):
-    raise ValueError("Plz set ANTHROPIC_AUTH_TOKEN or MODEL_ID first") 
+    raise ValueError("Plz set ANTHROPIC_AUTH_TOKEN or MODEL_ID first")
 
 if os.getenv("ANTHROPIC_BASE_URL"):
     os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
@@ -146,13 +152,24 @@ client = Anthropic(
 )
 MODEL = os.environ["MODEL_ID"]
 WORKDIR = Path.cwd()
+KEEP_RECENT = 3
+TRANSCRIPT_DIR = Path.cwd() / ".transcript"
+THRESHOLD = 50000  # Token limit for triggering auto-compaction
+
 SKILL_LOADER = SkillLoader(WORKDIR / "skills")
 
-SYSTEM = f"""You are a coding agent at {os.getcwd()}. Make todolist before act, don't explain.
-Skills available:
+SYSTEM = f"""You are a coding agent at {os.getcwd()}.
+Use load_skill to access specialized knowledge before tackling unfamiliar topics.
+
+skills available:
 {SKILL_LOADER.get_description()}
 """
-SUBAGENT_SYSTEM = f"You are a coding subagent created by father agent at {os.getcwd()}. Use bash to solve tasks. Make todolist before act, don't explain. After finished task, output the summy task result."
+SUBAGENT_SYSTEM = f"""You are a coding agent at {os.getcwd()}.
+Use load_skill to access specialized knowledge before tackling unfamiliar topics.
+
+skills available:
+{SKILL_LOADER.get_description()}
+"""
 
 TODO = TodoManager()
 
@@ -235,6 +252,15 @@ CHILD_TOOLS = [
 
 PARENT_TOOLS = CHILD_TOOLS + [
     {
+        "name": "compact",
+        "description": "Manually compact conversation history, clean up expired tool results.",
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
         "name": "task",
         "description": "Spawn a subagent with fresh context.",
         "input_schema": {
@@ -242,8 +268,10 @@ PARENT_TOOLS = CHILD_TOOLS + [
             "properties": {"prompt": {"type": "string"}},
             "required": ["prompt"],
         },
-    }
+    },
 ]
+
+PRESERVE_RESULT_TOOLS = {"read_file"}
 
 TOOL_HANDLERS = {
     "bash": lambda **kw: run_bash(kw["command"]),
@@ -253,15 +281,89 @@ TOOL_HANDLERS = {
     "todo": lambda **kw: TODO.update(kw["items"]),
     "task": lambda **kw: run_subagent(kw["prompt"]),
     "load_skill": lambda **kw: SKILL_LOADER.get_content(kw["name"]),
+    "compact": lambda **kw: "<compact>",
 }
+
+
+def estimate_tokens(messages: list) -> int:
+    """Rough token count: ~4 chars per token."""
+    print(f"[tokens:{len(str(messages)) // 4}]")
+    return len(str(messages)) // 4
+
+
+def micro_compact(messages: list) -> list:
+    tool_results = []
+    tool_name_map = {}
+    for i, msg in enumerate(messages):
+        if msg["role"] == "user" and isinstance(msg.get("content"), list):
+            for j, part in enumerate(msg.get("content")):
+                if isinstance(part, dict) and part.get("type") == "tool_result":
+                    tool_results.append((i, j, part))
+        elif msg["role"] == "assistant" and isinstance(msg.get("content"), list):
+            for block in msg.get("content"):
+                if hasattr(block, "type") and block.type == "tool_use":
+                    tool_name_map[block.id] = block.name
+
+    if len(tool_results) <= KEEP_RECENT:
+        return messages
+
+    for _, _, part in tool_results[:-KEEP_RECENT]:
+        if not isinstance(part.get("content"), str) or len(part["content"]) <= 100:
+            continue
+        tool_id = part.get("tool_use_id", "")
+        tool_name = tool_name_map.get(tool_id, "unknown")
+        if tool_name in PRESERVE_RESULT_TOOLS:
+            continue
+        part["content"] = f"[Previous: used {tool_name}]"
+    return messages
+
+
+def auto_compact(messages: list) -> list:
+    # Save transcript for recovery
+    print("[auto_compact...]")
+    TRANSCRIPT_DIR.mkdir(exist_ok=True)
+    transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time())}.jsonl"
+    with open(transcript_path, "w") as f:
+        for msg in messages:
+            f.write(json.dumps(msg, default=str) + "\n")
+    print(f"[transcript saved: {transcript_path}]")
+
+    # LLM summarizes
+    response = client.messages.create(
+        model=MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": "Summarize this conversation for continuity. Include:"
+                + "1) What was accomplished, 2) Current state, 3) Key decisions made."
+                + "Be concise but preserve critical details.\n\n"
+                + json.dumps(messages, default=str)[-80000:],
+            }
+        ],
+        max_tokens=2000,
+    )
+    summary = next(
+        (block.text for block in response.content if hasattr(block, "text")), ""
+    )
+    if not summary:
+        summary = "No summary generated."
+    # Replace all messages with compressed summary
+    return [
+        {
+            "role": "user",
+            "content": f"[Conversation compressed. Transcript: {transcript_path}]\n\n{summary}",
+        },
+    ]
 
 
 def run_subagent(prompt: str) -> str:
     messages = [{"role": "user", "content": prompt}]
     rounds_since_todo = 0
+    manual_todo = False
 
     # safe call
     for _ in range(30):
+        micro_compact(messages)
         response = client.messages.create(
             model=MODEL,
             system=SUBAGENT_SYSTEM,
@@ -280,8 +382,13 @@ def run_subagent(prompt: str) -> str:
             return "Finish! No summy!"
         # Execute each tool call, collect results
         results = []
+        manual_compact = False
         for block in response.content:
             if block.type == "tool_use":
+                if block.name == "compact":
+                    manual_compact = True
+                    print("Compressing...")
+                    continue
                 print(f"\033[33msubagent$ {block.name}\033[0m")
                 handler = TOOL_HANDLERS.get(block.name)
                 output = (
@@ -289,10 +396,19 @@ def run_subagent(prompt: str) -> str:
                 )
                 if block.name == "todo":
                     print(output)
+                    manual_todo = True
                     rounds_since_todo = 0
                 results.append(
-                    {"type": "tool_result", "tool_use_id": block.id, "content": output}
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": output,
+                    }
                 )
+        if manual_compact:
+            print("[manual compact]")
+            messages[:] = auto_compact(messages)
+            break
         messages.append({"role": "user", "content": results})
         if rounds_since_todo >= 3 and messages:
             last = messages[-1]
@@ -304,7 +420,8 @@ def run_subagent(prompt: str) -> str:
                         "text": "<reminder>Update your todos.</reminder>",
                     },
                 )
-        rounds_since_todo += 1
+        if manual_todo:
+            rounds_since_todo += 1
 
     messages.append(
         {
@@ -326,17 +443,14 @@ def run_subagent(prompt: str) -> str:
 
 
 def run_bash(command: str) -> str:
-    if not command:
-        return "Error: unexpected commmand"
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
-    #TODO: add more block
     if any(d in command for d in dangerous):
         return "Error: Dangerous command blocked"
     try:
         r = subprocess.run(
             command,
             shell=True,
-            cwd=os.getcwd(),
+            cwd=WORKDIR,
             capture_output=True,
             text=True,
             timeout=120,
@@ -345,16 +459,59 @@ def run_bash(command: str) -> str:
         return out[:50000] if out else "(no output)"
     except subprocess.TimeoutExpired:
         return "Error: Timeout (120s)"
-    except (FileNotFoundError, OSError) as e:
-        return f"Error: {e}"
+
+
+# def run_bash(command: str) -> str:
+#     if not command:
+#         return "Error: unexpected commmand"
+#     dangerous = ["rm", "sudo", "shutdown", "reboot", "del", "format", " attrib"]
+#     try:
+#         is_windows = platform.system() == "Windows"
+#         args = shlex.split(command, posix=not is_windows)
+#     except ValueError as e:
+#         return f"Error: invalid command syntax: {e}"
+#
+#     if not args:
+#         return "Error: empty command"
+#
+#     # Check for dangerous patterns in command name
+#     cmd_name = args[0].lower()
+#     for d in dangerous:
+#         if d in cmd_name or cmd_name.endswith(d) or cmd_name == d:
+#             return f"Error: Dangerous command blocked: {args[0]}"
+#
+#     # Check for redirects (Unix and Windows)
+#     for arg in args[1:]:
+#         if arg.startswith(">"):
+#             return f"Error: Dangerous redirect blocked: {arg}"
+#
+#     try:
+#         r = subprocess.run(
+#             args,
+#             shell=False,
+#             cwd=os.getcwd(),
+#             capture_output=True,
+#             text=True,
+#             timeout=120,
+#         )
+#         out = (r.stdout + r.stderr).strip()
+#         return out[:50000] if out else "(no output)"
+#     except subprocess.TimeoutExpired:
+#         return "Error: Timeout (120s)"
+#     except (FileNotFoundError, OSError) as e:
+#         return f"Error: {e}"
 
 
 def safe_path(p: str) -> Path:
     try:
-        path = (Path.cwd() / p).resolve(strict=True)
+        path = (Path.cwd() / p).resolve()
     except Exception as e:
         raise e
+    # Verify path is within workspace
     if not path.is_relative_to(Path.cwd()):
+        raise ValueError(f"Path escapes workspace: {p}")
+    # Ensure resolved path is still within workspace
+    if not path.resolve().is_relative_to(Path.cwd().resolve()):
         raise ValueError(f"Path escapes workspace: {p}")
     return path
 
@@ -397,7 +554,12 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
 # -- The core pattern: a while loop that calls tools until the model stops --
 def agent_loop(messages: list):
     rounds_since_todo = 0
+    manual_todo = False
     while True:
+        micro_compact(messages)
+        if estimate_tokens(messages) > THRESHOLD:
+            print("[auto_compact triggered]")
+            messages[:] = auto_compact(messages)
         response = client.messages.create(
             model=MODEL,
             system=SYSTEM,
@@ -413,20 +575,40 @@ def agent_loop(messages: list):
             return
         # Execute each tool call, collect results
         results = []
+        manual_compact = False
         for block in response.content:
             if block.type == "tool_use":
+                if block.name == "compact":
+                    print("Compressing...")
+                    manual_compact = True
+                    continue
                 print(f"\033[33m$ {block.name}\033[0m")
                 handler = TOOL_HANDLERS.get(block.name)
-                output = (
-                    handler(**block.input) if handler else f"unknown tool {block.name}"
-                )
+                try:
+                    output = (
+                        handler(**block.input)
+                        if handler
+                        else f"unknown tool {block.name}"
+                    )
+                except Exception as e:
+                    output = f"Error: {e}"
                 if block.name == "todo":
                     print(output)
+                    manual_todo = True
                     rounds_since_todo = 0
+                print(output[:200])
                 results.append(
-                    {"type": "tool_result", "tool_use_id": block.id, "content": output}
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": str(output),
+                    }
                 )
         messages.append({"role": "user", "content": results})
+        if manual_compact:
+            print("[manual compact]")
+            messages[:] = auto_compact(messages)
+            return
         if rounds_since_todo >= 3 and messages:
             last = messages[-1]
             if last["role"] == "user" and isinstance(last.get("content"), list):
@@ -437,7 +619,8 @@ def agent_loop(messages: list):
                         "text": "<reminder>Update your todos.</reminder>",
                     },
                 )
-        rounds_since_todo += 1
+        if manual_todo:
+            rounds_since_todo += 1
 
 
 if __name__ == "__main__":
