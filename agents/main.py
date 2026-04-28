@@ -25,13 +25,13 @@ policy, hooks, and lifecycle controls on top.
 """
 
 import json
-import shlex
-import platform
 import os
 from pathlib import Path
 import re
 import subprocess
-from time import time
+import time
+import anthropic
+from anthropic.types import Message
 import yaml
 from typing import Any
 
@@ -48,7 +48,7 @@ try:
 except ImportError:
     pass
 
-from anthropic import Anthropic
+from anthropic import Anthropic, Omit, omit
 from dotenv import load_dotenv
 
 load_dotenv(override=True)
@@ -154,7 +154,7 @@ MODEL = os.environ["MODEL_ID"]
 WORKDIR = Path.cwd()
 KEEP_RECENT = 3
 TRANSCRIPT_DIR = Path.cwd() / ".transcript"
-THRESHOLD = 50000  # Token limit for triggering auto-compaction
+THRESHOLD = 20000  # Token limit for triggering auto-compaction
 
 SKILL_LOADER = SkillLoader(WORKDIR / "skills")
 
@@ -284,6 +284,73 @@ TOOL_HANDLERS = {
     "compact": lambda **kw: "<compact>",
 }
 
+MAX_RETRY = 3
+
+
+def agent_invoke(
+    messages: list,
+    system: str | Omit = omit,
+    tools: Any | Omit = omit,
+    max_tokens: int = 8000,
+) -> Message:
+    """
+    Wrapper for Anthropic API calls with retry logic and proper error handling.
+
+    Args:
+        messages: List of message dictionaries
+        system: Optional system prompt
+        tools: Optional list of tools
+        max_tokens: Maximum tokens for response (default: 2000)
+        timeout: Network timeout in seconds (default: None, uses client default)
+
+    Returns:
+        anthropic.types.Message object
+
+    Raises:
+        anthropic.APIError: If all retries fail or non-retryable error occurs
+        TimeoutError: If request times out after retries
+    """
+    last_exception = None
+
+    for attempt in range(MAX_RETRY):
+        try:
+            # Build kwargs dynamically to avoid passing None values
+            response = client.messages.create(
+                model=MODEL,
+                tools=tools,
+                max_tokens=max_tokens,
+                messages=messages,
+                system=system,
+            )
+            return response
+
+        except anthropic.APITimeoutError as e:
+            last_exception = e
+            if attempt < MAX_RETRY - 1:
+                # Exponential backoff: 1s, 2s, 4s
+                time.sleep(2**attempt)
+            continue
+
+        except anthropic.APIStatusError as e:
+            # Check if error is retryable
+            if attempt < MAX_RETRY - 1:
+                last_exception = e
+                time.sleep(2**attempt)
+                continue
+            else:
+                # Non-retryable error, re-raise immediately
+                raise e
+
+        except Exception as e:
+            # Unexpected errors should be raised immediately
+            raise e
+
+    # All retries exhausted
+    if isinstance(last_exception, anthropic.Timeout):
+        raise TimeoutError(f"Request timed out after {MAX_RETRY} attempts")
+    else:
+        raise last_exception
+
 
 def estimate_tokens(messages: list) -> int:
     """Rough token count: ~4 chars per token."""
@@ -322,22 +389,24 @@ def auto_compact(messages: list) -> list:
     # Save transcript for recovery
     print("[auto_compact...]")
     TRANSCRIPT_DIR.mkdir(exist_ok=True)
-    transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time())}.jsonl"
+    transcript_path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
     with open(transcript_path, "w") as f:
         for msg in messages:
             f.write(json.dumps(msg, default=str) + "\n")
     print(f"[transcript saved: {transcript_path}]")
 
     # LLM summarizes
-    response = client.messages.create(
-        model=MODEL,
+    json_str = json.dumps(messages, default=str)
+    if len(json_str) > 80000:
+        json_str = json.dumps(messages[-2 * 2 * KEEP_RECENT :], default=str)
+    response = agent_invoke(
         messages=[
             {
                 "role": "user",
                 "content": "Summarize this conversation for continuity. Include:"
                 + "1) What was accomplished, 2) Current state, 3) Key decisions made."
                 + "Be concise but preserve critical details.\n\n"
-                + json.dumps(messages, default=str)[-80000:],
+                + json_str,
             }
         ],
         max_tokens=2000,
@@ -364,8 +433,10 @@ def run_subagent(prompt: str) -> str:
     # safe call
     for _ in range(30):
         micro_compact(messages)
-        response = client.messages.create(
-            model=MODEL,
+        if estimate_tokens(messages) > THRESHOLD:
+            print("[auto_compact triggered]")
+            auto_compact(messages)
+        response = agent_invoke(
             system=SUBAGENT_SYSTEM,
             messages=messages,
             tools=CHILD_TOOLS,
@@ -405,11 +476,11 @@ def run_subagent(prompt: str) -> str:
                         "content": output,
                     }
                 )
+        messages.append({"role": "user", "content": results})
         if manual_compact:
             print("[manual compact]")
             messages[:] = auto_compact(messages)
             break
-        messages.append({"role": "user", "content": results})
         if rounds_since_todo >= 3 and messages:
             last = messages[-1]
             if last["role"] == "user" and isinstance(last.get("content"), list):
@@ -429,8 +500,7 @@ def run_subagent(prompt: str) -> str:
             "content": "just summize your current work progress and result and do nothing.",
         }
     )
-    response = client.messages.create(
-        model=MODEL,
+    response = agent_invoke(
         system=SUBAGENT_SYSTEM,
         messages=messages,
         tools=CHILD_TOOLS,
@@ -443,9 +513,11 @@ def run_subagent(prompt: str) -> str:
 
 
 def run_bash(command: str) -> str:
+    if not command:
+        raise ValueError("Error: unexpected input")
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
     if any(d in command for d in dangerous):
-        return "Error: Dangerous command blocked"
+        raise ValueError("Error: Dangerous command blocked")
     try:
         r = subprocess.run(
             command,
@@ -457,49 +529,8 @@ def run_bash(command: str) -> str:
         )
         out = (r.stdout + r.stderr).strip()
         return out[:50000] if out else "(no output)"
-    except subprocess.TimeoutExpired:
-        return "Error: Timeout (120s)"
-
-
-# def run_bash(command: str) -> str:
-#     if not command:
-#         return "Error: unexpected commmand"
-#     dangerous = ["rm", "sudo", "shutdown", "reboot", "del", "format", " attrib"]
-#     try:
-#         is_windows = platform.system() == "Windows"
-#         args = shlex.split(command, posix=not is_windows)
-#     except ValueError as e:
-#         return f"Error: invalid command syntax: {e}"
-#
-#     if not args:
-#         return "Error: empty command"
-#
-#     # Check for dangerous patterns in command name
-#     cmd_name = args[0].lower()
-#     for d in dangerous:
-#         if d in cmd_name or cmd_name.endswith(d) or cmd_name == d:
-#             return f"Error: Dangerous command blocked: {args[0]}"
-#
-#     # Check for redirects (Unix and Windows)
-#     for arg in args[1:]:
-#         if arg.startswith(">"):
-#             return f"Error: Dangerous redirect blocked: {arg}"
-#
-#     try:
-#         r = subprocess.run(
-#             args,
-#             shell=False,
-#             cwd=os.getcwd(),
-#             capture_output=True,
-#             text=True,
-#             timeout=120,
-#         )
-#         out = (r.stdout + r.stderr).strip()
-#         return out[:50000] if out else "(no output)"
-#     except subprocess.TimeoutExpired:
-#         return "Error: Timeout (120s)"
-#     except (FileNotFoundError, OSError) as e:
-#         return f"Error: {e}"
+    except Exception as e:
+        raise e
 
 
 def safe_path(p: str) -> Path:
@@ -524,7 +555,7 @@ def run_read(path: str, limit: int | None = None) -> str:
             lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
         return "\n".join(lines)[:50000]
     except Exception as e:
-        return f"Error: {e}"
+        raise e
 
 
 def run_write(path: str, content: str) -> str:
@@ -536,7 +567,7 @@ def run_write(path: str, content: str) -> str:
         fp.write_text(content)
         return f"Wrote {len(content)} bytes to {path}"
     except Exception as e:
-        return f"Error: {e}"
+        raise e
 
 
 def run_edit(path: str, old_text: str, new_text: str) -> str:
@@ -544,11 +575,11 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         fp = safe_path(path)
         content = fp.read_text()
         if old_text not in content:
-            return f"Text not found in {path}"
+            raise ValueError(f"Text not found in {path}")
         fp.write_text(content.replace(old_text, new_text, 1))
         return f"Edited {path}"
     except Exception as e:
-        return f"Error: {e}"
+        raise e
 
 
 # -- The core pattern: a while loop that calls tools until the model stops --
@@ -560,8 +591,7 @@ def agent_loop(messages: list):
         if estimate_tokens(messages) > THRESHOLD:
             print("[auto_compact triggered]")
             messages[:] = auto_compact(messages)
-        response = client.messages.create(
-            model=MODEL,
+        response = agent_invoke(
             system=SYSTEM,
             messages=messages,
             tools=PARENT_TOOLS,
