@@ -30,10 +30,13 @@ from pathlib import Path
 import re
 import subprocess
 import time
-import anthropic
-from anthropic.types import Message
-import yaml
 from typing import Any
+
+import anthropic
+from anthropic import Anthropic, Omit, omit
+from anthropic.types import Message
+from dotenv import load_dotenv
+import yaml
 
 
 try:
@@ -48,10 +51,96 @@ try:
 except ImportError:
     pass
 
-from anthropic import Anthropic, Omit, omit
-from dotenv import load_dotenv
 
 load_dotenv(override=True)
+
+
+class TaskManager:
+    def __init__(self, tasks_dir: Path) -> None:
+        self.dir = tasks_dir
+        self.dir.mkdir(exist_ok=True)
+        self._next_id = self._max_id() + 1
+
+    def create(self, subject, description: str = "") -> str:
+        task = {
+            "id": self._next_id,
+            "subject": subject,
+            "status": "pending",
+            "blockedBy": [],
+            "owner": "",
+        }
+        self._save(task)
+        self._next_id += 1
+        return json.dumps(task, indent=2, ensure_ascii=False)
+
+    def _save(self, task: dict):
+        path = self.dir / f"task_{task['id']}.json"
+        path.write_text(json.dumps(task, indent=2, ensure_ascii=False))
+
+    def _max_id(self) -> int:
+        max_id = 0
+        for f in self.dir.glob("task_*.json"):
+            try:
+                task_id = int(f.stem.split("_")[1])
+                max_id = max(max_id, task_id)
+            except (ValueError, IndexError):
+                continue
+        return max_id
+
+    def _clear_dependency(self, completed_id: int):
+        for f in self.dir.glob("task_*.json"):
+            task = json.loads(f.read_text())
+            if completed_id in task.get("blockedBy", []):
+                task["blockedBy"].remove(completed_id)
+                self._save(task)
+
+    def _load(self, task_id: int) -> dict:
+        path = self.dir / f"task_{task_id}.json"
+        if not path.exists():
+            raise ValueError(f"Task {task_id} not found")
+        return json.loads(path.read_text())
+
+    def get(self, task_id: int) -> str:
+        return json.dumps(self._loado(task_id), indent=2, ensure_ascii=False)
+
+    def update(
+        self,
+        task_id: int,
+        status: str = None,
+        add_blocked_by: list = None,
+        remove_blocked_by: list = None,
+    ):
+        task = self._load(task_id)
+        if status:
+            task["status"] = status
+            if status == "completed":
+                self._clear_dependency(task_id)
+        if add_blocked_by:
+            task["blockedBy"] = list(set(task["blockedBy"] + add_blocked_by))
+        if remove_blocked_by:
+            task["blockedBy"] = [
+                x for x in task["blockedBy"] if x not in remove_blocked_by
+            ]
+        self._save(task)
+        return str(self._load(task_id))
+
+    def list_all(self) -> str:
+        tasks = []
+        files = sorted(
+            self.dir.glob("task_*.json"), key=lambda f: int(f.stem.split("_")[1])
+        )
+        for f in files:
+            tasks.append(json.loads(f.read_text()))
+        if not tasks:
+            return "No tasks."
+        lines = []
+        for t in tasks:
+            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}.get(
+                t["status"], "[?]"
+            )
+            blocked = f" (blocked by: {t['blockedBy']})" if t.get("blockedBy") else ""
+            lines.append(f"{marker} #{t['id']}: {t['subject']}{blocked}")
+        return "\n".join(lines)
 
 
 class SkillLoader:
@@ -153,7 +242,8 @@ client = Anthropic(
 MODEL = os.environ["MODEL_ID"]
 WORKDIR = Path.cwd()
 KEEP_RECENT = 3
-TRANSCRIPT_DIR = Path.cwd() / ".transcript"
+TRANSCRIPT_DIR = Path.cwd() / ".transcripts"
+TASKS_DIR = Path.cwd() / ".tasks"
 THRESHOLD = 20000  # Token limit for triggering auto-compaction
 
 SKILL_LOADER = SkillLoader(WORKDIR / "skills")
@@ -172,8 +262,52 @@ skills available:
 """
 
 TODO = TodoManager()
+TASKS = TaskManager(TASKS_DIR)
 
 CHILD_TOOLS = [
+    {
+        "name": "task_create",
+        "description": "Create a new task.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "subject": {"type": "string"},
+                "description": {"type": "string"},
+            },
+            "required": ["subject"],
+        },
+    },
+    {
+        "name": "task_update",
+        "description": "Update a task's status or dependencies.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "task_id": {"type": "integer"},
+                "status": {
+                    "type": "string",
+                    "enum": ["pending", "in_progress", "completed"],
+                },
+                "addBlockedBy": {"type": "array", "items": {"type": "integer"}},
+                "removeBlockedBy": {"type": "array", "items": {"type": "integer"}},
+            },
+            "required": ["task_id"],
+        },
+    },
+    {
+        "name": "task_list",
+        "description": "List all tasks with status summary.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "task_get",
+        "description": "Get full details of a task by ID.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"task_id": {"type": "integer"}},
+            "required": ["task_id"],
+        },
+    },
     {
         "name": "load_skill",
         "description": "load the skill content",
@@ -261,7 +395,7 @@ PARENT_TOOLS = CHILD_TOOLS + [
         },
     },
     {
-        "name": "task",
+        "name": "subagent",
         "description": "Spawn a subagent with fresh context.",
         "input_schema": {
             "type": "object",
@@ -279,9 +413,18 @@ TOOL_HANDLERS = {
     "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
     "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
     "todo": lambda **kw: TODO.update(kw["items"]),
-    "task": lambda **kw: run_subagent(kw["prompt"]),
+    "subagent": lambda **kw: run_subagent(kw["prompt"]),
     "load_skill": lambda **kw: SKILL_LOADER.get_content(kw["name"]),
     "compact": lambda **kw: "<compact>",
+    "task_create": lambda **kw: TASKS.create(kw["subject"], kw.get("description", "")),
+    "task_update": lambda **kw: TASKS.update(
+        kw["task_id"],
+        kw.get("status"),
+        kw.get("addBlockedBy"),
+        kw.get("removeBlockedBy"),
+    ),
+    "task_list": lambda **kw: TASKS.list_all(),
+    "task_get": lambda **kw: TASKS.get(kw["task_id"]),
 }
 
 MAX_RETRY = 3
@@ -310,7 +453,7 @@ def agent_invoke(
         anthropic.APIError: If all retries fail or non-retryable error occurs
         TimeoutError: If request times out after retries
     """
-    last_exception = None
+    last_exception = SystemError()
 
     for attempt in range(MAX_RETRY):
         try:
@@ -448,7 +591,7 @@ def run_subagent(prompt: str) -> str:
         # If the model didn't call a tool, we're done
         if response.stop_reason != "tool_use":
             for block in response.content:
-                if hasattr(block, "text"):
+                if block.type == "text":
                     return block.text
             return "Finish! No summy!"
         # Execute each tool call, collect results
