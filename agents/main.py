@@ -29,8 +29,10 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import threading
 import time
 from typing import Any
+import uuid
 
 import anthropic
 from anthropic import Anthropic, Omit, omit
@@ -63,6 +65,59 @@ client = Anthropic(
 )
 MODEL = env.get("ANTHROPIC_MODEL") or os.environ["MODEL_ID"]
 WORKDIR = Path.cwd()
+
+
+class BackgroundManager:
+    def __init__(self) -> None:
+        self.tasks = {}
+        self._notification_queue = []
+        self._lock = threading.Lock()
+
+    def run(self, command: str) -> str:
+        task_id = str(uuid.uuid4())[:8]
+        self.tasks[task_id] = {"status": "running", "command": command}
+        thread = threading.Thread(
+            target=self._execute, args=(task_id, command), daemon=True
+        )
+        thread.start()
+        return f"Background task {task_id} started"
+
+    def _execute(self, task_id: str, command: str):
+        try:
+            r = subprocess.run(
+                command,
+                shell=True,
+                cwd=WORKDIR,
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+            output = (r.stdout + r.stderr).strip()[:50000]
+            status = "completed"
+        except subprocess.TimeoutExpired:
+            output = "Error: Timeout (300s)"
+            status = "timeout"
+        with self._lock:
+            self.tasks[task_id]["status"] = status
+            self.tasks[task_id]["result"] = output
+            self._notification_queue.append(
+                {"task_id": task_id, "result": output[:500]}
+            )
+
+    def flush_notifications(self) -> list:
+        """Thread-safe: drain and return all pending notifications."""
+        with self._lock:
+            notifications = self._notification_queue[:]
+            self._notification_queue.clear()
+            return notifications
+
+    def get_task_status(self, task_id: str) -> dict | None:
+        """Get current status of a background task."""
+        with self._lock:
+            return self.tasks.get(task_id)
+
+
+BACKGROUND = BackgroundManager()
 
 
 class TaskManager:
@@ -378,6 +433,24 @@ CHILD_TOOLS = [
             "required": ["items"],
         },
     },
+    {
+        "name": "background_run",
+        "description": "Run a shell command in the background.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        },
+    },
+    {
+        "name": "background_status",
+        "description": "Get status of a background task by task_id.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"task_id": {"type": "string"}},
+            "required": ["task_id"],
+        },
+    },
 ]
 
 PARENT_TOOLS = CHILD_TOOLS + [
@@ -421,6 +494,10 @@ TOOL_HANDLERS = {
     ),
     "task_list": lambda **kw: TASKS.list_all(),
     "task_get": lambda **kw: TASKS.get(kw["task_id"]),
+    "background_run": lambda **kw: BACKGROUND.run(kw["command"]),
+    "background_status": lambda **kw: json.dumps(
+        BACKGROUND.get_task_status(kw["task_id"]) or {}
+    ),
 }
 
 MAX_RETRY = 3
@@ -726,6 +803,23 @@ def agent_loop(messages: list):
     rounds_since_todo = 0
     manual_todo = False
     while True:
+        # Flush background notifications before LLM call
+        notifications = BACKGROUND.flush_notifications()
+        if notifications:
+            for n in notifications:
+                print(f"\033[92m[background] {n['task_id']} completed\033[0m")
+                print(n["result"][:500])
+            xml_parts = ["<background-results>"]
+            for n in notifications:
+                xml_parts.append(
+                    f"<background-result task_id='{n['task_id']}'>"
+                    f"{n['result']}"
+                    f"</background-result>"
+                )
+            xml_parts.append("</background-results>")
+            bg_message = {"role": "user", "content": "\n".join(xml_parts)}
+            messages.append(bg_message)
+
         micro_compact(messages)
         if estimate_tokens(messages) > THRESHOLD:
             print("[auto_compact triggered]")
