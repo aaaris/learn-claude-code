@@ -54,6 +54,16 @@ except ImportError:
 
 load_dotenv(override=True)
 
+# Load Anthropic config from ~/.claude/settings.json
+settings = json.loads((Path.home() / ".claude" / "settings.json").read_text())
+env = settings.get("env", {})
+client = Anthropic(
+    base_url=env.get("ANTHROPIC_BASE_URL"),
+    default_headers={"Authorization": f"Bearer {env['ANTHROPIC_AUTH_TOKEN']}"},
+)
+MODEL = env.get("ANTHROPIC_MODEL") or os.environ["MODEL_ID"]
+WORKDIR = Path.cwd()
+
 
 class TaskManager:
     def __init__(self, tasks_dir: Path) -> None:
@@ -151,7 +161,7 @@ class SkillLoader:
 
     def _load_all(self):
         if not self.skills_dir.exists():
-            print(f"Error: skills dir is not exists")
+            print("Error: skills dir is not exists")
             return
         for f in sorted(self.skills_dir.rglob("SKILL.md")):
             try:
@@ -226,20 +236,6 @@ class TodoManager:
         )
 
 
-if not os.getenv("ANTHROPIC_API_KEY") or not os.getenv("MODEL_ID"):
-    raise ValueError("Plz set ANTHROPIC_AUTH_TOKEN or MODEL_ID first")
-
-if os.getenv("ANTHROPIC_BASE_URL"):
-    os.environ.pop("ANTHROPIC_AUTH_TOKEN", None)
-
-client = Anthropic(
-    base_url=os.getenv("ANTHROPIC_BASE_URL"),
-    default_headers={
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {os.getenv('ANTHROPIC_API_KEY')}",
-    },
-)
-MODEL = os.environ["MODEL_ID"]
 WORKDIR = Path.cwd()
 KEEP_RECENT = 3
 TRANSCRIPT_DIR = Path.cwd() / ".transcripts"
@@ -703,7 +699,7 @@ def run_read(path: str, limit: int | None = None) -> str:
 
 def run_write(path: str, content: str) -> str:
     if not content:
-        return f"Error: unexpected content"
+        return "Error: unexpected content"
     try:
         fp = safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
