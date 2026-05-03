@@ -226,3 +226,5 @@ test_providers.py
 analysis/
 analysis_progress.md
 web/src/data/generated
+CLAUDE.md
+.claude/
