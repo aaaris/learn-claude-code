@@ -166,7 +166,7 @@ class TaskManager:
         return json.loads(path.read_text())
 
     def get(self, task_id: int) -> str:
-        return json.dumps(self._loado(task_id), indent=2, ensure_ascii=False)
+        return json.dumps(self._load(task_id), indent=2, ensure_ascii=False)
 
     def update(
         self,
@@ -291,16 +291,193 @@ class TodoManager:
         )
 
 
+VALID_MSG_TYPES = {
+    "message",
+    "broadcast",
+    "shutdown_request",
+    "shutdown_response",
+    "plan_approval_response",
+}
+
+
+class MessageBus:
+    def __init__(self, inbox_dir: Path):
+        self.dir = inbox_dir
+        self.dir.mkdir(parents=True, exist_ok=True)
+
+    def send(
+        self, sender: str, to: str, content: str, msg_type: str = "message",
+        extra: dict = None,
+    ) -> str:
+        if msg_type not in VALID_MSG_TYPES:
+            return f"Error: Invalid type '{msg_type}'. Valid: {VALID_MSG_TYPES}"
+        msg = {
+            "type": msg_type,
+            "from": sender,
+            "content": content,
+            "timestamp": time.time(),
+        }
+        if extra:
+            msg.update(extra)
+        inbox_path = self.dir / f"{to}.jsonl"
+        with open(inbox_path, "a") as f:
+            f.write(json.dumps(msg) + "\n")
+        return f"Sent {msg_type} to {to}"
+
+    def read_inbox(self, name: str) -> list:
+        inbox_path = self.dir / f"{name}.jsonl"
+        if not inbox_path.exists():
+            return []
+        messages = []
+        for line in inbox_path.read_text().strip().splitlines():
+            if line:
+                messages.append(json.loads(line))
+        inbox_path.write_text("")
+        return messages
+
+    def broadcast(self, sender: str, content: str, teammates: list) -> str:
+        count = 0
+        for name in teammates:
+            if name != sender:
+                self.send(sender, name, content, "broadcast")
+                count += 1
+        return f"Broadcast to {count} teammates"
+
+
+class TeammateManager:
+    def __init__(self, team_dir: Path):
+        self.dir = team_dir
+        self.dir.mkdir(exist_ok=True)
+        self.config_path = self.dir / "config.json"
+        self.config = self._load_config()
+        self.threads = {}
+        self._lock = threading.Lock()
+
+    def _load_config(self) -> dict:
+        if self.config_path.exists():
+            return json.loads(self.config_path.read_text())
+        return {"team_name": "default", "members": []}
+
+    def _save_config(self):
+        with self._lock:
+            self.config_path.write_text(json.dumps(self.config, indent=2))
+
+    def _find_member(self, name: str) -> dict:
+        for m in self.config["members"]:
+            if m["name"] == name:
+                return m
+        return None
+
+    def spawn(self, name: str, role: str, prompt: str, max_rounds: int = 50) -> str:
+        with self._lock:
+            member = self._find_member(name)
+            if member:
+                if member["status"] == "working":
+                    return f"Error: '{name}' is currently working"
+                member["status"] = "working"
+                member["role"] = role
+                member["prompt"] = prompt
+            else:
+                member = {
+                    "name": name,
+                    "role": role,
+                    "status": "working",
+                    "prompt": prompt,
+                }
+                self.config["members"].append(member)
+        self._save_config()
+        thread = threading.Thread(
+            target=self._teammate_loop,
+            args=(name, role, prompt, max_rounds),
+            daemon=True,
+        )
+        self.threads[name] = thread
+        thread.start()
+        return f"Spawned '{name}' (role: {role}, max_rounds: {max_rounds})"
+
+    def _teammate_loop(self, name: str, role: str, prompt: str, max_rounds: int):
+        sys_prompt = (
+            f"You are '{name}', role: {role}, at {WORKDIR}. "
+            f"Use send_message to communicate with the lead and other teammates. "
+            f"Use load_skill to access specialized knowledge. Complete your task."
+        )
+        messages = [{"role": "user", "content": prompt}]
+        tools = CHILD_TOOLS + TEAMMATE_MSG_TOOLS
+        for _ in range(max_rounds):
+            inbox = BUS.read_inbox(name)
+            for msg in inbox:
+                messages.append({"role": "user", "content": json.dumps(msg)})
+            micro_compact(messages)
+            try:
+                response = agent_invoke(
+                    system=sys_prompt,
+                    messages=messages,
+                    tools=tools,
+                    max_tokens=8000,
+                )
+            except Exception:
+                break
+            messages.append({"role": "assistant", "content": response.content})
+            if response.stop_reason != "tool_use":
+                break
+            results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    output = self._exec_teammate(name, block.name, block.input)
+                    print(
+                        f"\033[33m  [{name}] {block.name}\033[0m: {str(output)[:120]}"
+                    )
+                    results.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": block.id,
+                            "content": str(output),
+                        }
+                    )
+            messages.append({"role": "user", "content": results})
+        with self._lock:
+            member = self._find_member(name)
+            if member and member["status"] != "shutdown":
+                member["status"] = "idle"
+        self._save_config()
+
+    def _exec_teammate(self, sender: str, tool_name: str, args: dict) -> str:
+        if tool_name == "send_message":
+            return BUS.send(
+                sender, args["to"], args["content"], args.get("msg_type", "message")
+            )
+        if tool_name == "read_inbox":
+            return json.dumps(BUS.read_inbox(sender), indent=2)
+        handler = TOOL_HANDLERS.get(tool_name)
+        if handler:
+            return handler(**args)
+        return f"Unknown tool: {tool_name}"
+
+    def list_all(self) -> str:
+        if not self.config["members"]:
+            return "No teammates."
+        lines = [f"Team: {self.config['team_name']}"]
+        for m in self.config["members"]:
+            lines.append(f"  {m['name']} ({m['role']}): {m['status']}")
+        return "\n".join(lines)
+
+    def member_names(self) -> list:
+        return [m["name"] for m in self.config["members"]]
+
+
 WORKDIR = Path.cwd()
 KEEP_RECENT = 3
 TRANSCRIPT_DIR = Path.cwd() / ".transcripts"
 TASKS_DIR = Path.cwd() / ".tasks"
 THRESHOLD = 20000  # Token limit for triggering auto-compaction
+TEAM_DIR = WORKDIR / ".team"
+INBOX_DIR = TEAM_DIR / "inbox"
 
 SKILL_LOADER = SkillLoader(WORKDIR / "skills")
 
 SYSTEM = f"""You are a coding agent at {os.getcwd()}.
 Use load_skill to access specialized knowledge before tackling unfamiliar topics.
+You can spawn teammates using spawn_teammate and communicate via send_message/read_inbox/broadcast.
 
 skills available:
 {SKILL_LOADER.get_description()}
@@ -314,6 +491,8 @@ skills available:
 
 TODO = TodoManager()
 TASKS = TaskManager(TASKS_DIR)
+BUS = MessageBus(INBOX_DIR)
+TEAM = TeammateManager(TEAM_DIR)
 
 CHILD_TOOLS = [
     {
@@ -382,7 +561,7 @@ CHILD_TOOLS = [
         "description": "Read file's content.",
         "input_schema": {
             "type": "object",
-            "properties": {"path": {"type": "string"}, "limit": {"type": "int"}},
+            "properties": {"path": {"type": "string"}, "limit": {"type": "integer"}},
             "required": ["path"],
         },
     },
@@ -474,6 +653,81 @@ PARENT_TOOLS = CHILD_TOOLS + [
     },
 ]
 
+LEAD_TEAM_TOOLS = [
+    {
+        "name": "spawn_teammate",
+        "description": "Spawn a persistent teammate that runs in its own thread with agent loop.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "role": {"type": "string"},
+                "prompt": {"type": "string"},
+                "max_rounds": {
+                    "type": "integer",
+                    "description": "Max agent loop iterations (default 50)",
+                },
+            },
+            "required": ["name", "role", "prompt"],
+        },
+    },
+    {
+        "name": "list_teammates",
+        "description": "List all teammates with name, role, and status.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "send_message",
+        "description": "Send a message to a teammate's inbox.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string"},
+                "content": {"type": "string"},
+                "msg_type": {"type": "string", "enum": list(VALID_MSG_TYPES)},
+            },
+            "required": ["to", "content"],
+        },
+    },
+    {
+        "name": "read_inbox",
+        "description": "Read and drain the lead's inbox.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "broadcast",
+        "description": "Send a message to all teammates.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"content": {"type": "string"}},
+            "required": ["content"],
+        },
+    },
+]
+
+TEAMMATE_MSG_TOOLS = [
+    {
+        "name": "send_message",
+        "description": "Send a message to the lead or another teammate.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "to": {"type": "string"},
+                "content": {"type": "string"},
+                "msg_type": {"type": "string", "enum": list(VALID_MSG_TYPES)},
+            },
+            "required": ["to", "content"],
+        },
+    },
+    {
+        "name": "read_inbox",
+        "description": "Read and drain your inbox.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+]
+
+PARENT_TOOLS = PARENT_TOOLS + LEAD_TEAM_TOOLS
+
 PRESERVE_RESULT_TOOLS = {"read_file"}
 
 TOOL_HANDLERS = {
@@ -498,6 +752,15 @@ TOOL_HANDLERS = {
     "background_status": lambda **kw: json.dumps(
         BACKGROUND.get_task_status(kw["task_id"]) or {}
     ),
+    "spawn_teammate": lambda **kw: TEAM.spawn(
+        kw["name"], kw["role"], kw["prompt"], kw.get("max_rounds", 50)
+    ),
+    "list_teammates": lambda **kw: TEAM.list_all(),
+    "send_message": lambda **kw: BUS.send(
+        "lead", kw["to"], kw["content"], kw.get("msg_type", "message")
+    ),
+    "read_inbox": lambda **kw: json.dumps(BUS.read_inbox("lead"), indent=2),
+    "broadcast": lambda **kw: BUS.broadcast("lead", kw["content"], TEAM.member_names()),
 }
 
 MAX_RETRY = 3
@@ -820,6 +1083,17 @@ def agent_loop(messages: list):
             bg_message = {"role": "user", "content": "\n".join(xml_parts)}
             messages.append(bg_message)
 
+        # Check lead inbox for teammate messages
+        inbox = BUS.read_inbox("lead")
+        if inbox:
+            print(f"\033[92m[team] {len(inbox)} message(s) from teammates\033[0m")
+            messages.append(
+                {
+                    "role": "user",
+                    "content": f"<team-inbox>{json.dumps(inbox, indent=2)}</team-inbox>",
+                }
+            )
+
         micro_compact(messages)
         if estimate_tokens(messages) > THRESHOLD:
             print("[auto_compact triggered]")
@@ -895,6 +1169,15 @@ if __name__ == "__main__":
             break
         if query.strip().lower() in ("q", "exit", ""):
             break
+        if query.strip() == "/team":
+            print(TEAM.list_all())
+            continue
+        if query.strip() == "/inbox":
+            print(json.dumps(BUS.read_inbox("lead"), indent=2))
+            continue
+        if query.strip() == "/compact":
+            auto_compact(history)
+            continue
         history.append({"role": "user", "content": query})
         agent_loop(history)
         response_content = history[-1]["content"]
